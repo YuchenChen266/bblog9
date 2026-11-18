@@ -1,0 +1,299 @@
+---
+title: 'Predicting Stock Returns with Gradient Boosting:'
+author: "Yuchen Chen"
+date: "2026-11-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(zoo)
+  library(ggplot2)
+  library(httr)
+  library(jsonlite)
+  library(gbm)
+})
+
+args_all <- commandArgs(trailingOnly = FALSE)
+file_arg <- grep("^--file=", args_all, value = TRUE)
+if (length(file_arg) == 1) {
+  setwd(file.path(dirname(sub("^--file=", "", file_arg)), ".."))
+}
+
+dir.create("results", showWarnings = FALSE)
+dir.create("data", showWarnings = FALSE)
+pal <- c("#4C72B0", "#C44E52", "#55A868")
+```
+## Question and Motivation
+We use stock price data to train the machine learning model, to predict the stock return next month. The tool was gradient boosting and the result is thoughful. This blog revisits this experiment and make careful and subjective interpretation of the prediction task, strictly using data outside the sample, and compare the original model and simple baseline. The standard of the evaluation uses the true combination of the return, not statistical fit. 
+
+## Why Predicting Stock Returns Is So Hard
+The hard point is not from any specific algorithm. In efficient markets, the current price has digested public information, therefor next month return is mainly dominated by new information and noise, the approximation walks randomly. Even there exist observable signal, the strenth is much smaller than noise and would change over time. The modle with high flexibility is easier to remember the coincidence pattern in the sample, which is useful in the sample but not outside it. Therefore all the results would adopt would follow a strict walk forward evaluation. Every month the model only use history data training, then predict the monthly data that has never seen.
+
+## Data and Features
+This blog uses daily adjusted closes from 30 large U.S. stocks and the S&P 500 index from Yahoo Finance. The prediction goal is the return rate next month, all the predict variables only use the information available in t period: the 1,3,6,12 month's momentum, realized volatility over the last one month or oneyear, and the distance from the 52-week high. At the same time set the simple baseline model, which is the average return over the past 12 month.
+
+```{r}
+tickers <- c("AAPL","MSFT","GOOGL","AMZN","JPM","V","PG","KO","XOM","JNJ","WMT",
+             "NFLX","DIS","HD","UNH","BA","INTC","CSCO","ORCL","MRK","PEP","CVX",
+             "ABBV","IBM","T","PFE","NVDA","TSLA","META","AMD")
+spx_ticker <- "^GSPC"
+cache_csv  <- "data/prices.csv"
+
+fetch_daily <- function(symbol, p1, p2) {
+  url <- sprintf(
+    "https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d",
+    URLencode(symbol, reserved = TRUE), p1, p2)
+  r <- RETRY("GET", url, user_agent("Mozilla/5.0"), timeout(30),
+             times = 3, quiet = TRUE)
+  if (status_code(r) != 200) stop("HTTP ", status_code(r), " for ", symbol)
+  d <- jsonlite::fromJSON(httr::content(r, as = "text"))
+  res1 <- d$chart$result
+  ts   <- as.numeric(unlist(res1$timestamp))
+  cl   <- as.numeric(unlist(res1$indicators$quote[[1]]$close))
+  adj  <- as.numeric(unlist(res1$indicators$adjclose[[1]]$adjclose))
+  px   <- if (!is.null(adj) && !all(is.na(adj))) adj else cl
+  date <- as.Date(floor(ts / 86400), origin = "1970-01-01")
+  out <- data.frame(symbol = symbol, date = date, close = px)
+  if (any(out$date < as.Date("2006-01-01") | out$date > Sys.Date() + 1))
+    stop("Implausible dates for ", symbol)
+  out[!duplicated(out$date) & !is.na(out$close), ]
+}
+
+if (file.exists(cache_csv)) {
+  prices <- read.csv(cache_csv)
+  prices$date <- as.Date(prices$date)
+} else {
+  p1 <- as.integer(as.POSIXct("2006-06-01"))
+  p2 <- as.integer(as.POSIXct(Sys.time()))
+  prices <- bind_rows(lapply(c(tickers, spx_ticker),
+                             function(s) fetch_daily(s, p1, p2)))
+  write.csv(prices, cache_csv, row.names = FALSE)
+}
+
+n_days_ref <- max(table(prices$symbol))
+sym_keep <- prices |>
+  group_by(symbol) |> summarise(n = dplyr::n()) |>
+  filter(n >= 0.5 * n_days_ref) |> pull(symbol)
+prices <- prices |> filter(symbol %in% sym_keep)
+
+monthly_close <- prices |>
+  mutate(month = lubridate::floor_date(date, "month")) |>
+  group_by(symbol, month) |>
+  summarise(close = tail(close[!is.na(close)], 1), .groups = "drop") |>
+  arrange(symbol, month)
+
+cut_month <- lubridate::floor_date(max(prices$date), "month")
+monthly_close <- monthly_close |> filter(month < cut_month)
+
+vol1m <- prices |>
+  group_by(symbol) |> arrange(date) |>
+  mutate(ret = close / lag(close) - 1) |> ungroup() |>
+  mutate(month = lubridate::floor_date(date, "month")) |>
+  group_by(symbol, month) |>
+  summarise(vol1m = sd(ret, na.rm = TRUE) * sqrt(252), .groups = "drop")
+
+panel <- monthly_close |>
+  left_join(vol1m, by = c("symbol", "month")) |>
+  group_by(symbol) |> arrange(month) |>
+  mutate(
+    r1m  = close / lag(close, 1)  - 1,
+    r3m  = close / lag(close, 3)  - 1,
+    r6m  = close / lag(close, 6)  - 1,
+    r12m = close / lag(close, 12) - 1,
+    target = lead(close, 1) / close - 1,
+    hi12 = zoo::rollapply(close, 12, max, partial = TRUE, align = "right"),
+    dist_high = close / hi12 - 1,
+    bench_pred = r12m / 12
+  ) |>
+  mutate(vol12m = zoo::rollapply(vol1m, 12, function(x) mean(x, na.rm = TRUE),
+                                 partial = TRUE, align = "right")) |>
+  ungroup()
+
+feats <- c("r1m", "r3m", "r6m", "r12m", "vol1m", "vol12m", "dist_high")
+panel <- panel |> drop_na(all_of(c(feats, "target", "bench_pred")))
+
+test_months <- panel |> pull(month) |> unique() |> sort() |> tail(60)
+```
+
+## The Original Model
+The gradient boosting is constructed by several shallow regression trees, each fitted to the residue of the current model, the final result is the sum of all the trees. The original model is simplified and only use few momentum features. This evaluation rule is the key of the experiment. For every reserved month, the model onnly use earlier data training, then predict every stock each month.
+
+
+```{r}
+walk_forward <- function(feature_set, pars) {
+  set.seed(2026)
+  do.call(rbind, lapply(test_months, function(m) {
+    tr <- panel[panel$month < m, ]
+    te <- panel[panel$month == m, ]
+    if (nrow(tr) < 120 || nrow(te) == 0) return(NULL)
+    fit <- do.call(gbm::gbm,
+                   c(list(formula = target ~ .,
+                          data = tr[, c(feature_set, "target")],
+                          distribution = "gaussian", verbose = FALSE), pars))
+    data.frame(month = m, symbol = te$symbol, target = te$target,
+               pred = predict(fit, newdata = te[, feature_set, drop = FALSE],
+                              n.trees = pars$n.trees))
+  }))
+}
+
+pars_orig <- list(n.trees = 100, interaction.depth = 3, shrinkage = 0.1,
+                  bag.fraction = 0.5, n.minobsinnode = 10)
+pred_orig <- walk_forward(c("r1m", "r3m", "r12m"), pars_orig)
+```
+
+Totally produced 1860 out of sample forcast value, which refer to each stock, each reserved month and every one made by a model that never see the month data.
+
+## Attempting to Improve the Model
+The improvement is mainly two parts. For the feature aspect, the improved model put an extra six month momentum, two groups of  volatility measures and the distance for the 52 weeks highest point variable. For the hyper parameter aspect, setting 200 trees and set the learing rate at 0.02, each tree randomly select 80% of the sample, enlarge the sample size of the smallest node.
+
+```{r improved-model}
+pars_impr <- list(n.trees = 200, interaction.depth = 4, shrinkage = 0.02,
+                  bag.fraction = 0.8, n.minobsinnode = 20)
+pred_impr <- walk_forward(feats, pars_impr)
+
+# simple benchmark on exactly the same test rows
+pred_bench <- panel[panel$month %in% pred_orig$month,
+                    c("month", "symbol","target", "bench_pred")]
+```
+
+## Out-of-Sample Predictive 
+Out-of-sample R² compares the model predicted squared errors with directly use the history average value to do the constant prediction. The positive value means the model has true predict ability in the data that have not seen.
+
+```{r predictive-metrics}
+pred_metrics <- function(p, col = "pred") {
+  y <- p$target; yhat <- p[[col]]
+  sse <- sum((y - yhat)^2); sst <- sum((y - mean(y))^2)
+  c(OOS_R2   = 1 - sse / sst,
+    RMSE     = sqrt(sse / nrow(p)),
+    Sign_acc = mean(sign(yhat) == sign(y)),
+    Corr     = cor(yhat, y))
+}
+tab_pred <- rbind(
+  "Simple benchmark" = pred_metrics(pred_bench, "bench_pred"),
+  "Original GBM"     = pred_metrics(pred_orig),
+  "Improved GBM"     = pred_metrics(pred_impr))
+
+pred_display <- data.frame(
+  Model = rownames(tab_pred),
+  R2    = round(tab_pred[, "OOS_R2"], 3),
+  RMSE  = round(tab_pred[, "RMSE"], 4),
+  Sign  = paste0(round(100 * tab_pred[, "Sign_acc"], 1), "%"),
+  Corr  = round(tab_pred[, "Corr"], 3))
+names(pred_display) <- c("Model", "OOS R²", "RMSE", "Sign accuracy", "Corr(pred, actual)")
+knitr::kable(pred_display, row.names = FALSE,
+             caption = "Out-of-sample predictive performance, 60 held-out months.")
+```
+
+```{r fig1-pred-vs-actual}
+scat <- bind_rows(Original = pred_orig, Improved = pred_impr, .id = "model")
+ggplot(scat, aes(pred, target)) +
+  geom_point(size = 0.9, alpha = 0.35, color = pal[1]) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 0, color = "grey85") +
+  geom_vline(xintercept = 0, color = "grey85") +
+  facet_wrap(~model, scales = "free") +
+  labs(title = "Out-of-sample: predicted vs actual next-month returns",
+       x = "Predicted return", y = "Actual return") +
+  theme_bw()
+```
+
+The scatter plot the cloud is flat. If the prediction is effective, the scatter points would along the 45 degree line upward, but the prediction here can alomst not explain the true fluctuation of the return.
+
+## What the Improved Model Actually Learns
+What features does the improved model rely more on?  Fitting it once on all pre-test data and measuring each feature's relative influence gives the answer.
+
+```{r feature-importance}
+set.seed(2026)
+tr_all <- panel[panel$month < min(test_months), ]
+fit_full <- do.call(gbm::gbm,
+                    c(list(formula = target ~ .,
+                           data = tr_all[, c(feats, "target")],
+                           distribution = "gaussian", verbose = FALSE), pars_impr))
+rel <- summary(fit_full, plotit = FALSE)     # data.frame: var, rel.inf
+imp_df <- data.frame(feature = as.character(rel$var),
+                     influence = as.numeric(rel$rel.inf)) |>
+  mutate(feature = recode(feature,
+    "r1m" = "1-month momentum", "r3m" = "3-month momentum",
+    "r6m" = "6-month momentum", "r12m" = "12-month momentum",
+    "vol1m" = "1-month volatility", "vol12m" = "12-month volatility",
+    "dist_high" = "Distance from 52-week high"))
+
+ggplot(imp_df, aes(reorder(feature, influence), influence)) +
+  geom_col(fill = pal[1]) + coord_flip() +
+  labs(title = "What the improved GBM leans on (relative influence)",
+       x = NULL, y = "Relative influence (%)") +
+  theme_bw()
+
+```
+
+The model with the highest percentage is 12-month momentum. But the importance of feature is not equal the predictive ability. These are only the splits that reduce in the loss, which cannot transform into out of sample accuracy.
+
+## Would the Predictions Have Made Money?
+Statistical fit is not equal actual return. Each month using predicted return to rank the stock, with long the top 20% and short the bottom 20% and compare with S&P 500.
+
+```{r backtest}
+ls_series <- function(p) {
+  p |>
+    group_by(month) |>
+    mutate(q = dplyr::percent_rank(pred)) |>
+    summarise(long  = mean(target[q >= 0.8]),
+              short = mean(target[q <= 0.2]),
+              .groups = "drop") |>
+    mutate(ls = long - short) |> arrange(month)
+}
+ls_orig <- ls_series(pred_orig)
+ls_impr <- ls_series(pred_impr)
+
+spx_ret <- monthly_close |>
+  filter(symbol == spx_ticker) |>
+  arrange(month) |>
+  mutate(ret = close / lag(close, 1) - 1) |>
+  drop_na(ret) |>
+  filter(month %in% pred_impr$month)
+
+ann_stat <- function(x) {
+  c(`Ann. return` = mean(x) * 12, `Ann. vol` = sd(x) * sqrt(12),
+    Sharpe = mean(x) * 12 / (sd(x) * sqrt(12)))
+}
+tab_econ <- rbind(
+  "Long-short (Original GBM)" = ann_stat(ls_orig$ls),
+  "Long-short (Improved GBM)" = ann_stat(ls_impr$ls),
+  "Buy & hold S&P 500"        = ann_stat(spx_ret$ret))
+
+econ_display <- data.frame(
+  Strategy = rownames(tab_econ),
+  Ret = paste0(round(100 * tab_econ[, 1], 1), "%"),
+  Vol = paste0(round(100 * tab_econ[, 2], 1), "%"),
+  Sharpe = round(tab_econ[, 3], 2))
+names(econ_display) <- c("Strategy", "Ann. return", "Ann. vol", "Sharpe")
+knitr::kable(econ_display, row.names = FALSE,
+             caption = "Economic performance over the out-of-sample window.")
+```
+```{r fig2-wealth}
+wealth <- bind_rows(
+  data.frame(month = ls_orig$month, value = cumprod(1 + ls_orig$ls),
+             series = "Long-short (Original GBM)"),
+  data.frame(month = ls_impr$month, value = cumprod(1 + ls_impr$ls),
+             series = "Long-short (Improved GBM)"),
+  data.frame(month = spx_ret$month, value = cumprod(1 + spx_ret$ret),
+             series = "Buy & hold S&P 500"))
+ggplot(wealth, aes(month, value, color = series)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Long-short (Original GBM)" = pal[2],
+                                "Long-short (Improved GBM)" = pal[1],
+                                "Buy & hold S&P 500" = "black")) +
+  scale_y_log10() +
+  labs(title = "Growth of $1 over the out-of-sample window (log scale)",
+       x = "Month", y = "Growth of $1", color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+The improved model has some return, and the result is before transaction costs, while this strategy every month should adjust many positions.
+
+## Takeaway
+A more complex gradient-boosting model still cannot to predict monthly stock returns out of sample. The R square out of sample stay small negative, the prediction rate of the sign accuracy is only slightly higher than random guess, the correlation between the realized returns are close to 0. The improvement is true, but is marginal. The evaluation dicipline is more important than the model itself. Walk forward testing and setting a simple baseline would make the result more credible. The monthly return is mostly dominated by new imformation and noise, the transaction return only rely on history prices would be feable and unstable.
+
